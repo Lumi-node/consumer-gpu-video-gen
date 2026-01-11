@@ -1,0 +1,30 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Quantization
+quanto>=0.2.0
+
+# Diffusers (for LTX-2)
+diffusers>=0.36.0
+transformers>=4.40.0
+accelerate>=0.25.0
+
+# Video processing
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.8
+
+# Utilities
+tqdm>=4.65.0
+numpy>=1.24.0
+einops>=0.7.0
+easydict>=1.10
+
+# Hugging Face
+huggingface-hub>=0.20.0
+safetensors>=0.4.0
+sentencepiece>=0.1.99
+
+# Optional: for FP8 quantization (requires newer GPUs)
+# torchao>=0.1.0
