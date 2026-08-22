@@ -194,6 +194,19 @@ def main() -> int:
 
         guidance_scale = guidance_default if config.use_cfg else 1.0
 
+        # Distilled checkpoints (e.g. LTX-2.5's distilled transformer) run unguided
+        # and are driven by an explicit sigma schedule. Passing num_inference_steps
+        # instead hands them a generic linear schedule, which quietly costs quality --
+        # and would show up here as a quality regression wrongly attributed to
+        # caching or quantization.
+        if not config.use_cfg:
+            print(
+                "  NOTE: CFG is disabled, which usually means a distilled checkpoint. "
+                "If this checkpoint expects an explicit sigma schedule, "
+                f"--steps {args.steps} will be used instead and quality will suffer. "
+                "Check the model card before trusting this row."
+            )
+
         try:
             pipeline = load_pipeline(args, config.precision)
         except Exception as exc:  # noqa: BLE001 - one bad config must not sink the sweep
