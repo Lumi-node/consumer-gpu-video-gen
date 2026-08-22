@@ -26,5 +26,9 @@ huggingface-hub>=0.20.0
 safetensors>=0.4.0
 sentencepiece>=0.1.99
 
-# Optional: for FP8 quantization (requires newer GPUs)
-# torchao>=0.1.0
+# Narrow-precision compute backends (NVFP4 / FP8).
+# Unlike quanto's weight-only INT4, these feed narrow types to the tensor cores and
+# so reduce latency as well as VRAM. NVFP4 needs a Blackwell card (RTX 50-series);
+# FP8 needs Ada (RTX 40-series) or newer. Optional -- the pipelines fall back to
+# quanto INT4 with an explanation when torchao is absent.
+# torchao>=0.9.0

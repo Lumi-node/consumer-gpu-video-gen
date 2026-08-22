@@ -20,6 +20,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.memory import get_vram_usage, clear_vram, offload_models, print_vram_status
 from utils.quantization import quantize_model_int4, QuantizationType
+from utils.fp4 import apply_precision, detect_availability, detect_capability, quantizes_on_cpu
+from utils.precision import expected_speed_note, select_backend
+from utils.cache_policy import StepCachePolicy, linear_threshold_schedule
+from utils.caching import StepCache, cfg_note, relative_l1_distance
 
 
 class Wan22Pipeline:
@@ -73,24 +77,39 @@ class Wan22Pipeline:
         self.dit = None
         self.config = None
         self.scheduler = None
+        self.selection = None
 
         self._loaded = False
 
     def load(
         self,
         quantization: QuantizationType = "int4",
+        precision: str = None,
+        goal: str = "memory",
         verbose: bool = True
     ) -> "Wan22Pipeline":
         """
         Load all model components with optional quantization.
 
         Args:
-            quantization: Quantization type ("int4", "int8", or "none")
+            quantization: Legacy quantization type ("int4", "int8", or "none"). Kept
+                for backwards compatibility; `precision` takes priority when given.
+            precision: Precision backend: "auto", "nvfp4", "fp8", "int4", "int8" or
+                "bf16". Only "nvfp4"/"fp8" reduce latency as well as VRAM, and they
+                require Blackwell / Ada respectively.
+            goal: "memory" or "speed"; decides what "auto" resolves to.
             verbose: Whether to print loading progress
 
         Returns:
             Self for chaining
         """
+        if precision is None:
+            precision = "bf16" if quantization == "none" else quantization
+
+        self.selection = select_backend(
+            precision, detect_capability(), detect_availability(), goal=goal
+        )
+        resolved = self.selection.precision
         # Import Wan modules
         from wan.configs import WAN_CONFIGS
         from wan.modules.model import WanModel
@@ -102,7 +121,7 @@ class Wan22Pipeline:
 
         if verbose:
             print("=" * 60)
-            print("Loading Wan 2.2 TI2V-5B with INT4 Optimization")
+            print(f"Loading Wan 2.2 TI2V-5B ({resolved})")
             print("=" * 60)
             print(f"GPU: {torch.cuda.get_device_name()}")
             print(f"Checkpoint: {self.checkpoint_dir}")
@@ -141,16 +160,25 @@ class Wan22Pipeline:
         if verbose:
             print("   DiT loaded on CPU")
 
-        # 4. Apply quantization
-        if quantization != "none":
-            if verbose:
-                print(f"\n4. Applying {quantization.upper()} quantization to DiT...")
-            quantize_model_int4(self.dit, verbose=False)
-            if verbose:
-                print(f"   DiT quantized to {quantization.upper()}")
+        # 4/5. Quantize and place the DiT.
+        # Weight-only backends are applied on CPU so the bf16 weights never have to
+        # fit in VRAM; the torchao compute backends need the module on the device
+        # first. Previously this branch always called the INT4 helper, so asking for
+        # int8 silently produced an int4 model.
+        if verbose:
+            print(f"\n4. Applying {resolved} to DiT...")
+            print(f"   {self.selection.explain()}")
+            print(f"   {expected_speed_note(resolved)}")
 
-        # 5. Move DiT to GPU
-        self.dit = self.dit.to(self.device)
+        if resolved == "bf16":
+            self.dit = self.dit.to(self.device)
+        elif quantizes_on_cpu(resolved):
+            apply_precision(self.dit, resolved, verbose=False)
+            self.dit = self.dit.to(self.device)
+        else:
+            self.dit = self.dit.to(self.device)
+            apply_precision(self.dit, resolved, verbose=False)
+
         self.dit.eval()
         clear_vram()
         if verbose:
@@ -181,6 +209,9 @@ class Wan22Pipeline:
         num_steps: int = 30,
         guidance_scale: float = 5.0,
         seed: int = -1,
+        cache: bool = False,
+        cache_threshold: float = 0.15,
+        timestep_aware: bool = False,
         verbose: bool = True,
     ) -> torch.Tensor:
         """
@@ -192,8 +223,16 @@ class Wan22Pipeline:
             size: "landscape" (1280x704) or "portrait" (704x1280)
             num_frames: Number of frames (must be 4n+1: 17, 21, 25, 29, 33, 49, 81, etc.)
             num_steps: Number of diffusion steps (30 recommended)
-            guidance_scale: Classifier-free guidance scale (5.0 recommended)
+            guidance_scale: Classifier-free guidance scale (5.0 recommended). At or
+                below 1.0 the unconditional pass is skipped entirely, halving the
+                transformer work per step -- but quality only holds on a
+                guidance-distilled checkpoint.
             seed: Random seed (-1 for random)
+            cache: Reuse the previous noise prediction on steps the policy judges
+                redundant. A reused step skips both CFG passes.
+            cache_threshold: Accumulated-change budget before forcing a recompute.
+            timestep_aware: Use a decreasing threshold schedule rather than a flat
+                one -- permissive early, strict late. Experimental.
             verbose: Whether to print progress
 
         Returns:
@@ -260,8 +299,35 @@ class Wan22Pipeline:
         latent = noise
         iterator = tqdm(timesteps, desc="Generating") if verbose else timesteps
 
+        # Above 1.0 CFG needs a second, unconditional transformer pass per step.
+        do_cfg = guidance_scale > 1.0
+        if verbose:
+            print(f"   {cfg_note(guidance_scale)}")
+
+        # Caching is applied to the combined noise prediction rather than to an
+        # internal residual: this loop calls the DiT directly, so a reused step skips
+        # both the conditional and unconditional pass. Consecutive predictions are
+        # close for the same reason residual caching works, but this is the coarser
+        # of the two formulations -- validate quality against the bf16 baseline.
+        policy = None
+        if cache:
+            threshold = (
+                linear_threshold_schedule(cache_threshold * 2.0, cache_threshold * 0.25)
+                if timestep_aware
+                else cache_threshold
+            )
+            policy = StepCachePolicy(
+                threshold=threshold,
+                total_steps=num_steps,
+                warmup_steps=2,
+                cooldown_steps=2,
+            )
+            policy.reset()
+        cached_pred = None
+        previous_latent = None
+
         with torch.amp.autocast('cuda', dtype=torch.bfloat16), torch.no_grad():
-            for t in iterator:
+            for step_index, t in enumerate(iterator):
                 # Prepare timestep
                 timestep = torch.tensor([t], device=self.device)
                 temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
@@ -271,10 +337,30 @@ class Wan22Pipeline:
                 ])
                 timestep = temp_ts.unsqueeze(0)
 
-                # CFG
-                noise_pred_cond = self.dit([latent], t=timestep, **arg_c)[0]
-                noise_pred_uncond = self.dit([latent], t=timestep, **arg_null)[0]
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                if policy is None:
+                    should_compute = True
+                elif cached_pred is None or previous_latent is None:
+                    should_compute = policy.force_compute()
+                else:
+                    should_compute = policy.should_compute(
+                        step_index, relative_l1_distance(latent, previous_latent)
+                    )
+
+                if policy is not None:
+                    previous_latent = latent.detach().clone()
+
+                if should_compute:
+                    noise_pred_cond = self.dit([latent], t=timestep, **arg_c)[0]
+                    if do_cfg:
+                        noise_pred_uncond = self.dit([latent], t=timestep, **arg_null)[0]
+                        noise_pred = noise_pred_uncond + guidance_scale * (
+                            noise_pred_cond - noise_pred_uncond
+                        )
+                    else:
+                        noise_pred = noise_pred_cond
+                    cached_pred = noise_pred.detach()
+                else:
+                    noise_pred = cached_pred
 
                 # Scheduler step
                 latent = self.scheduler.step(
@@ -287,6 +373,10 @@ class Wan22Pipeline:
             print("Offloading models for VAE decode...")
         self.dit.cpu()
         self.t5.model.cpu()
+        if policy is not None and verbose:
+            print(f"   {policy.stats.summary()}")
+        self.last_cache_stats = policy.stats if policy is not None else None
+
         del noise, context, context_null, arg_c, arg_null, mask2
         torch.cuda.synchronize()
         clear_vram()

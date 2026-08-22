@@ -57,3 +57,31 @@ Tested on NVIDIA RTX 5090 (32GB VRAM) with CUDA 12.8, PyTorch 2.9.1
 - Wan 2.2 with INT4 is borderline
 - Reduce frames to 17
 - LTX-2 unlikely to work
+
+---
+
+## Measurement caveats
+
+The figures above predate `benchmarks/benchmark.py` and should be re-measured with it.
+Two known issues with how they were produced:
+
+- **The "peak" rows are not peaks.** They were read via `utils.memory.get_vram_usage`,
+  which calls `torch.cuda.memory_allocated()` — the allocation at the instant of the
+  call, not the maximum. Transient spikes (notably VAE decode) are undercounted. The
+  new harness uses `max_memory_allocated()` and `max_memory_reserved()`; the latter is
+  what actually decides whether a run OOMs.
+
+- **The generation times have no baseline.** There is no bf16 time on the same
+  hardware and settings to compare against, so they do not support any claim that
+  quantization made generation faster. It very likely did not: quanto INT4 is
+  weight-only, so every matmul still runs in bf16 after dequantizing. It is a memory
+  optimization.
+
+To regenerate with a real baseline:
+
+```bash
+python benchmarks/benchmark.py --model wan22 \
+    --checkpoint-dir /models/Wan2.2-TI2V-5B --wan-repo /repos/Wan2.2 \
+    --configs bf16 int4 nvfp4 nvfp4+cache \
+    --repeats 3 --output benchmarks/results.md
+```
